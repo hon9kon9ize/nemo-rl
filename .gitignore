@@ -1,0 +1,6 @@
+pretrained_models/
+nemo_rl_output/
+__pycache__/
+.DS_Store
+*.log
+*.pyc
