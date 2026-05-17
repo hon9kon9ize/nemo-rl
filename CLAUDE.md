@@ -100,6 +100,17 @@ Use `--generation-log-file path/to/file.jsonl` to choose a path, or
 `--disable-generation-logging` to turn it off. The logger is implemented as a no-op
 reward function that always returns `0.0`, so it does not change training scores.
 
+Chat-template handling follows `../reasoning_grpo`: `--assistant-prefill-think` appends
+`<think>\n` after the assistant generation marker when needed, and
+`--normalize-prefilled-think` restores that opening tag before reward parsing and JSONL
+reward summaries. This is required for Qwen-style generations that begin with a closing
+`</think>` because the opening tag was part of the prompt.
+
+`train.py` validates the formatted `prompt` column before model loading. Use
+`--validate-prompts-only` to load the tokenizer and dataset, print assistant prompt tails,
+and exit before constructing the model/trainer. For Qwen3 reasoning mode the assistant
+tail must contain an unmatched `<think>` prefix.
+
 Use `--wandb` or `-wandb` to report TRL training metrics to Weights & Biases. The
 underlying `report_to` value is resolved from `--report-to` plus the W&B convenience flag.
 

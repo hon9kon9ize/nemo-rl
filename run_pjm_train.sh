@@ -57,6 +57,8 @@ python -u train.py \
   --num-generations 2 \
   --max-prompt-length "$MAX_PROMPT" \
   --max-completion-length "$MAX_COMPLETION" \
+  --assistant-prefill-think \
+  --normalize-prefilled-think \
   --reasoning-lang yue \
   --use-lora \
   --lora-rank 16 \

@@ -56,6 +56,36 @@ Default reward functions:
 3. `correctness_gated_language_consistency_reward`: optional language score, enabled by `--reasoning-lang`, also gated by correctness.
 4. `generation_jsonl_logger`: no-op reward returning `0.0`; logs generations for debugging.
 
+The trainer follows the `../reasoning_grpo` chat-template handling:
+
+- `--assistant-prefill-think` is enabled by default and appends `<think>\n` after the
+  assistant generation marker when the tokenizer template does not already do so.
+- `--normalize-prefilled-think` is enabled by default and reconstructs that prefilled
+  opening tag before reward parsing, so completions that start with `</think>` can still
+  be scored as balanced `<think>...</think>` blocks.
+- `--chat-template-enable-thinking` / `--no-chat-template-enable-thinking` can pass an
+  explicit `enable_thinking` value to tokenizer chat templates that support it.
+
+Before model loading, `train.py` validates the formatted `prompt` column and prints the
+assistant-generation tail for a few rows. For Qwen3-style reasoning runs, the prompt tail
+should end with an unmatched assistant-side `<think>` prefix, for example:
+
+```text
+<|im_start|>assistant
+<think>
+```
+
+Run prompt validation without starting training:
+
+```bash
+python train.py \
+  --model-id /path/to/model_or_tokenizer \
+  --dataset nemotron-crossthink \
+  --max-samples 2 \
+  --reasoning-lang yue \
+  --validate-prompts-only
+```
+
 With `--reasoning-lang en`, validated CrossThink examples score:
 
 ```text

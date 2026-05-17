@@ -37,6 +37,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--max-prompt-length", type=int, default=512)
     parser.add_argument("--max-completion-length", type=int, default=1024)
+    parser.add_argument(
+        "--validate-prompts-only",
+        action="store_true",
+        help="Build and validate the prompt column, print sample prompt tails, then exit before model/trainer loading.",
+    )
+    parser.add_argument(
+        "--prompt-validation-samples",
+        type=int,
+        default=3,
+        help="Number of formatted prompts to inspect during prompt validation.",
+    )
+    parser.add_argument(
+        "--chat-template-enable-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Optional passthrough for tokenizer.apply_chat_template(enable_thinking=...).",
+    )
+    parser.add_argument(
+        "--assistant-prefill-think",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append an opening <think> to the assistant prompt when the chat template does not already do it.",
+    )
+    parser.add_argument(
+        "--normalize-prefilled-think",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prepend a missing opening <think> back to completions before reward parsing when the prompt prefilled it.",
+    )
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--seed", type=int, default=42)
@@ -157,6 +186,148 @@ def _jsonable(value: Any) -> Any:
 def _stable_hash(value: Any) -> str:
     text = "" if value is None else str(value)
     return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def assistant_generation_tail(prompt: str) -> str:
+    """Return only the generated-assistant prefix of a formatted chat prompt."""
+    for marker in assistant_generation_markers():
+        index = prompt.rfind(marker)
+        if index >= 0:
+            return prompt[index + len(marker):]
+    return prompt[-256:]
+
+
+def assistant_generation_markers() -> tuple[str, ...]:
+    """Known assistant generation markers used by common chat templates."""
+    return (
+        "<|im_start|>assistant\n",
+        "<|start_header_id|>assistant<|end_header_id|>\n\n",
+        "<assistant>",
+        "assistant\n",
+    )
+
+
+def has_assistant_generation_marker(prompt: Any) -> bool:
+    text = "" if prompt is None else str(prompt)
+    return any(marker in text for marker in assistant_generation_markers())
+
+
+def prompt_prefills_open_think(prompt: Any) -> bool:
+    """Return whether the prompt leaves an unmatched opening <think> for generation."""
+    text = "" if prompt is None else str(prompt)
+    assistant_tail = assistant_generation_tail(text)
+    stripped = assistant_tail.lstrip()
+    return stripped.startswith("<think>") and assistant_tail.count("<think>") > assistant_tail.count("</think>")
+
+
+def apply_chat_template_text(
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    enable_thinking: bool | None = None,
+    assistant_prefill_think: bool = True,
+) -> str:
+    """Apply the tokenizer chat template with optional Qwen thinking-mode handling."""
+    if enable_thinking is False and assistant_prefill_think:
+        print(
+            "Warning: --no-chat-template-enable-thinking asks the tokenizer for "
+            "non-thinking mode, but --assistant-prefill-think will append a new "
+            "open <think>. For Qwen3 reasoning runs, leave "
+            "--chat-template-enable-thinking unset or set it true."
+        )
+    kwargs: dict[str, Any] = {}
+    if enable_thinking is not None:
+        kwargs["enable_thinking"] = enable_thinking
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        **kwargs,
+    )
+    if assistant_prefill_think and not prompt_prefills_open_think(prompt):
+        return prompt + "<think>\n"
+    return prompt
+
+
+def normalize_prefilled_think_completion(prompt: Any, completion: Any) -> str:
+    """Reconstruct a prompt-prefilled opening <think> before reward parsing."""
+    completion_text = _completion_text(completion)
+    if not prompt_prefills_open_think(prompt):
+        return completion_text
+    if completion_text.lstrip().startswith("<think>"):
+        return completion_text
+    return "<think>" + completion_text
+
+
+def normalize_prefilled_think_completions(
+    prompts: list[Any],
+    completions: list[Any],
+    enabled: bool = True,
+) -> list[str]:
+    """Normalize a batch of completions for templates/prompts that prefilled <think>."""
+    if not enabled:
+        return [_completion_text(completion) for completion in completions]
+    if len(prompts) == len(completions):
+        return [
+            normalize_prefilled_think_completion(prompt, completion)
+            for prompt, completion in zip(prompts, completions)
+        ]
+    if len(prompts) == 1:
+        return [
+            normalize_prefilled_think_completion(prompts[0], completion)
+            for completion in completions
+        ]
+    return [_completion_text(completion) for completion in completions]
+
+
+def validate_prompt_column(
+    dataset: Any,
+    sample_count: int = 3,
+    require_prefilled_think: bool = True,
+) -> None:
+    """Print and validate prompt-column alignment with the assistant generation tail."""
+    total = len(dataset)
+    count = min(max(sample_count, 0), total)
+    if count == 0:
+        print("Prompt validation skipped: dataset is empty.")
+        return
+
+    marker_count = 0
+    prefill_count = 0
+    for index in range(count):
+        prompt = dataset[index]["prompt"]
+        has_marker = has_assistant_generation_marker(prompt)
+        prefills_think = prompt_prefills_open_think(prompt)
+        marker_count += int(has_marker)
+        prefill_count += int(prefills_think)
+        tail = assistant_generation_tail(str(prompt))
+        print(
+            f"Prompt validation sample {index}: "
+            f"has_assistant_marker={has_marker} "
+            f"prefills_open_think={prefills_think} "
+            f"assistant_tail={tail[-200:]!r}"
+        )
+        if "<think>\n\n</think>" in tail and prefills_think:
+            print(
+                "Warning: prompt tail contains Qwen3 non-thinking prefill "
+                "`<think>\\n\\n</think>` plus an open <think>. For reasoning runs, "
+                "prefer leaving --chat-template-enable-thinking unset or true."
+            )
+
+    print(
+        "Prompt validation summary: "
+        f"checked={count} assistant_marker={marker_count}/{count} "
+        f"prefilled_open_think={prefill_count}/{count}"
+    )
+    if marker_count != count:
+        raise ValueError(
+            "Formatted prompt column is missing a recognized assistant generation marker."
+        )
+    if require_prefilled_think and prefill_count != count:
+        raise ValueError(
+            "Formatted prompt column does not leave an unmatched assistant <think> "
+            "prefix. For Qwen3-style reasoning, keep --assistant-prefill-think enabled "
+            "and avoid --no-chat-template-enable-thinking."
+        )
 
 
 def _indexed_item(values: Any, index: int) -> Any | None:
@@ -333,6 +504,26 @@ def correctness_gated_reward(reward_func):
     return wrapped
 
 
+def with_prefilled_think_normalization(reward_func, enabled: bool = True):
+    """Wrap a reward function so prompt-prefilled <think> completions parse correctly."""
+
+    @functools.wraps(reward_func)
+    def wrapped(completions, *args, **kwargs):
+        prompt_values = kwargs.get("prompts", kwargs.get("prompt"))
+        completion_list = _as_list(completions)
+        if prompt_values is None:
+            normalized = [_completion_text(completion) for completion in completion_list]
+        else:
+            normalized = normalize_prefilled_think_completions(
+                _as_list(prompt_values),
+                completion_list,
+                enabled=enabled,
+            )
+        return reward_func(normalized, *args, **kwargs)
+
+    return wrapped
+
+
 def dataset_has_reasoning_lang(dataset: Any) -> bool:
     names = getattr(dataset, "column_names", None)
     if names is None and isinstance(dataset, dict):
@@ -351,14 +542,26 @@ def resolve_reasoning_lang(example: dict[str, Any], default: str | None) -> str 
 
 
 def select_reward_funcs(args: argparse.Namespace, dataset: Any) -> list[Any]:
-    reward_funcs = [correctness_reward, correctness_gated_reward(xml_format_reward)]
+    reward_funcs = [
+        with_prefilled_think_normalization(
+            correctness_reward,
+            enabled=args.normalize_prefilled_think,
+        ),
+        with_prefilled_think_normalization(
+            correctness_gated_reward(xml_format_reward),
+            enabled=args.normalize_prefilled_think,
+        ),
+    ]
     if args.reasoning_lang or dataset_has_reasoning_lang(dataset):
         reward_funcs.append(
-            correctness_gated_reward(
-                weighted_reward(
-                    language_consistency_reward,
-                    args.language_reward_weight,
-                )
+            with_prefilled_think_normalization(
+                correctness_gated_reward(
+                    weighted_reward(
+                        language_consistency_reward,
+                        args.language_reward_weight,
+                    )
+                ),
+                enabled=args.normalize_prefilled_think,
             )
         )
     if not args.disable_generation_logging:
@@ -479,6 +682,7 @@ class GenerationJsonlLogger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.include_prompts = args.generation_log_prompts
         self.language_reward_weight = args.language_reward_weight
+        self.normalize_prefilled_think = args.normalize_prefilled_think
         self._next_batch_id = 0
 
     def generation_jsonl_logger(
@@ -496,13 +700,23 @@ class GenerationJsonlLogger:
         completion_list = _as_list(completions)
         answer_list = _as_list(answer) if answer is not None else None
         prompt_values = prompts if prompts is not None else prompt
+        prompt_list = _as_list(prompt_values) if prompt_values is not None else []
+        normalized_completion_list = (
+            normalize_prefilled_think_completions(
+                prompt_list,
+                completion_list,
+                enabled=self.normalize_prefilled_think,
+            )
+            if prompt_values is not None
+            else [_completion_text(completion) for completion in completion_list]
+        )
 
         correctness = (
-            correctness_reward(completion_list, answer=answer_list, **kwargs)
+            correctness_reward(normalized_completion_list, answer=answer_list, **kwargs)
             if answer_list is not None
-            else [None] * len(completion_list)
+            else [None] * len(normalized_completion_list)
         )
-        format_rewards = xml_format_reward(completion_list, **kwargs)
+        format_rewards = xml_format_reward(normalized_completion_list, **kwargs)
         gated_format = [
             reward if correct and correct > 0.0 else 0.0
             for reward, correct in zip(format_rewards, correctness)
@@ -517,7 +731,7 @@ class GenerationJsonlLogger:
         gated_language: list[float | None]
         if language_values is not None:
             language_rewards = language_consistency_reward(
-                completion_list,
+                normalized_completion_list,
                 reasoning_lang=language_values,
                 **kwargs,
             )
@@ -534,6 +748,7 @@ class GenerationJsonlLogger:
         self._next_batch_id += 1
         created_at = time.time()
         for index, completion in enumerate(completion_list):
+            normalized_completion = _column_item(normalized_completion_list, index)
             correct = _column_item(correctness, index)
             fmt = _column_item(format_rewards, index)
             gated_fmt = _column_item(gated_format, index)
@@ -562,6 +777,8 @@ class GenerationJsonlLogger:
                 },
                 "weighted_reward": weighted_reward,
             }
+            if normalized_completion != _completion_text(completion):
+                record["normalized_completion"] = _jsonable(normalized_completion)
             prompt_item = _column_item(prompt_values, index)
             if self.include_prompts:
                 record["prompt"] = _jsonable(prompt_item)
@@ -598,10 +815,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    import torch
-    from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    from trl import GRPOConfig, GRPOTrainer
+    from transformers import AutoTokenizer
 
     # 1. Load Dataset
     raw_dataset = dataset_from_args(args)
@@ -622,8 +836,11 @@ def main():
             task_type=example.get("task_type", "math"),
             reasoning_lang=reasoning_lang,
         )
-        prompt = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        prompt = apply_chat_template_text(
+            tokenizer,
+            messages,
+            enable_thinking=args.chat_template_enable_thinking,
+            assistant_prefill_think=args.assistant_prefill_think,
         )
         formatted = {"prompt": prompt}
         if use_reasoning_lang:
@@ -631,6 +848,18 @@ def main():
         return formatted
 
     dataset = raw_dataset.map(format_reward_dataset)
+    validate_prompt_column(
+        dataset,
+        sample_count=args.prompt_validation_samples,
+        require_prefilled_think=args.assistant_prefill_think,
+    )
+    if args.validate_prompts_only:
+        return
+
+    import torch
+    from peft import LoraConfig, get_peft_model
+    from transformers import AutoModelForCausalLM
+    from trl import GRPOConfig, GRPOTrainer
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
