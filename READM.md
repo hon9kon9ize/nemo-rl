@@ -183,6 +183,8 @@ generation logging to `$OUTPUT_DIR/generations.jsonl`.
 
 - `--bf16` and `--use-lora` currently default to enabled because they use
   `store_true` with `default=True`; there is no `--no-bf16` or `--no-use-lora` yet.
+- `train.py` filters `GRPOConfig` kwargs against the installed TRL version. Unsupported
+  fields such as `max_prompt_length` are printed and ignored instead of crashing.
 - Math correctness is exact string matching today. For more robust math training,
   replace it with `math_verify`-style answer equivalence.
 - `test_crossthink.py` still imports `interleaved_grpo.datasets_loader`, which does not

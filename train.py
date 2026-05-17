@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import fields, is_dataclass
 import functools
 import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -384,6 +386,91 @@ def resolve_report_to(args: argparse.Namespace) -> str | list[str]:
     return report_targets if report_targets else "none"
 
 
+def supported_init_kwargs(config_cls: Any) -> set[str] | None:
+    """Return supported __init__ kwargs, or None when arbitrary kwargs are accepted."""
+    try:
+        signature = inspect.signature(config_cls.__init__)
+    except (TypeError, ValueError):
+        signature = None
+
+    if signature is not None:
+        supported: set[str] = set()
+        for name, parameter in signature.parameters.items():
+            if name == "self":
+                continue
+            if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+                return None
+            if parameter.kind in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }:
+                supported.add(name)
+        if supported:
+            return supported
+
+    if is_dataclass(config_cls):
+        return {field.name for field in fields(config_cls)}
+    return None
+
+
+def filter_supported_init_kwargs(
+    config_cls: Any,
+    kwargs: dict[str, Any],
+    object_name: str,
+) -> dict[str, Any]:
+    """Drop kwargs unsupported by the installed dependency version."""
+    supported = supported_init_kwargs(config_cls)
+    if supported is None:
+        return kwargs
+
+    filtered = {name: value for name, value in kwargs.items() if name in supported}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        print(
+            f"{object_name} does not support these arguments; ignoring them: "
+            f"{', '.join(dropped)}"
+        )
+    return filtered
+
+
+def build_grpo_config(config_cls: Any, args: argparse.Namespace) -> Any:
+    """Build GRPOConfig across TRL versions with different constructor signatures."""
+    kwargs = {
+        "output_dir": args.output_dir,
+        "learning_rate": args.learning_rate,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_train_epochs": args.num_train_epochs,
+        "max_steps": args.max_steps,
+        "num_generations": args.num_generations,
+        "max_prompt_length": args.max_prompt_length,
+        "max_completion_length": args.max_completion_length,
+        "temperature": args.temperature,
+        "beta": args.beta,
+        "remove_unused_columns": False,
+        "logging_steps": args.logging_steps,
+        "save_steps": args.save_steps,
+        "bf16": args.bf16,
+        "seed": args.seed,
+        "report_to": resolve_report_to(args),
+    }
+
+    supported = supported_init_kwargs(config_cls)
+    if (
+        supported is not None
+        and "max_completion_length" not in supported
+        and "generation_kwargs" in supported
+    ):
+        kwargs["generation_kwargs"] = {
+            "max_new_tokens": args.max_completion_length,
+            "temperature": args.temperature,
+        }
+
+    return config_cls(
+        **filter_supported_init_kwargs(config_cls, kwargs, "GRPOConfig")
+    )
+
+
 class GenerationJsonlLogger:
     """Write one JSONL record per generated completion without changing rewards."""
 
@@ -563,24 +650,7 @@ def main():
         model = get_peft_model(model, peft_config)
 
     # 3. Training Arguments
-    training_args = GRPOConfig(
-        output_dir=args.output_dir,
-        learning_rate=args.learning_rate,
-        per_device_train_batch_size=args.per_device_train_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs,
-        max_steps=args.max_steps,
-        num_generations=args.num_generations,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        temperature=args.temperature,
-        beta=args.beta,
-        logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
-        bf16=args.bf16,
-        seed=args.seed,
-        report_to=resolve_report_to(args),
-    )
+    training_args = build_grpo_config(GRPOConfig, args)
 
     # 4. Initialize GRPOTrainer
     trainer = GRPOTrainer(

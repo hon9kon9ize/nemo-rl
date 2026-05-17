@@ -138,6 +138,8 @@ When improving this, prefer the NeMo RL pattern:
 - `--bf16` and `--use-lora` are declared with `action="store_true", default=True`, so they
   are always enabled from the CLI. Use `argparse.BooleanOptionalAction` if `--no-bf16` or
   `--no-use-lora` should be possible.
+- `GRPOConfig` kwargs are filtered by the installed TRL constructor signature. On older
+  TRL versions, unsupported fields such as `max_prompt_length` are printed and ignored.
 - Local exact-answer matching is too strict for math training. CrossThink answers may need
   normalization or symbolic equivalence.
 - There is no dependency file. At minimum the runtime needs `datasets`, `trl`, `peft`,
