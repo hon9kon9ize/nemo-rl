@@ -10,6 +10,9 @@ if TYPE_CHECKING:
 
 
 DatasetName = Literal["gsm8k", "math", "nemotron-crossthink"]
+CROSSTHINK_MATH_DATA_FILE = (
+    "hf://datasets/nvidia/Nemotron-CrossThink/Data/Nemotron-CrossThink-Math.jsonl"
+)
 
 LANGUAGE_NAMES = {
     "en": "English",
@@ -105,13 +108,19 @@ def load_training_dataset(
         )
 
     elif dataset_name == "nemotron-crossthink":
-        # CrossThink has split names like 'train_math', 'test_math'
-        if split == "train":
-            split = "train_math"
-        elif split == "test":
-            split = "test_math"
+        if split not in {"train", "train_math"}:
+            raise ValueError(
+                "Nemotron-CrossThink math data is available locally as the "
+                f"train split; got split={split!r}."
+            )
 
-        dataset = load_dataset("nvidia/Nemotron-CrossThink", split=split)
+        # Loading the default dataset config can infer a too-narrow schema from
+        # the QA split before reading math rows. Load the math JSONL directly.
+        dataset = load_dataset(
+            "json",
+            data_files=CROSSTHINK_MATH_DATA_FILE,
+            split="train",
+        )
 
         def process_nemotron_crossthink(
             batch: dict[str, list[dict]],

@@ -35,7 +35,7 @@ Use these as source references when extending the project:
     generation JSONL logging, `processing_class=tokenizer`, optional vLLM, optional DAPO,
     and safer LoRA handling through `peft_config` when supported.
 - Dataset: `https://huggingface.co/datasets/nvidia/Nemotron-CrossThink`
-  - The math split used here is `train_math` / `test_math`.
+  - The math data used here comes from `Data/Nemotron-CrossThink-Math.jsonl`.
   - Public dataset fields include `data_source`, `prompt`, `reward_model`, and `meta_data`.
   - Current loader extracts `meta_data["question"]` and `reward_model["ground_truth"]`.
 - NeMo RL reward source: `https://github.com/NVIDIA-NeMo/RL`
@@ -53,8 +53,10 @@ Use these as source references when extending the project:
 - `answer`: the target final answer.
 - `task_type`: currently always `"math"` for CrossThink.
 
-For `nemotron-crossthink`, `--dataset-split train` maps to `train_math` and
-`--dataset-split test` maps to `test_math`.
+For `nemotron-crossthink`, use `--dataset-split train`. The loader reads
+`hf://datasets/nvidia/Nemotron-CrossThink/Data/Nemotron-CrossThink-Math.jsonl`
+directly because loading the default dataset config can infer a narrower schema from
+the QA split and then fail on math rows that include extra `meta_data` fields.
 
 Keep CrossThink processing separate from `gsm8k` and `hendrycks/competition_math`; the
 CrossThink source rows are nested dictionaries, not simple `question`/`answer` rows.
@@ -92,6 +94,14 @@ python train.py \
 
 This updates the chat prompt to request `<think>` reasoning in the target language and
 adds a language consistency reward with default multiplier `--language-reward-weight 0.2`.
+
+Generated completions are logged to JSONL by default at `OUTPUT_DIR/generations.jsonl`.
+Use `--generation-log-file path/to/file.jsonl` to choose a path, or
+`--disable-generation-logging` to turn it off. The logger is implemented as a no-op
+reward function that always returns `0.0`, so it does not change training scores.
+
+Use `--wandb` or `-wandb` to report TRL training metrics to Weights & Biases. The
+underlying `report_to` value is resolved from `--report-to` plus the W&B convenience flag.
 
 ## Reward Functions
 
@@ -159,6 +169,11 @@ print(len(ds), ds.column_names)
 print(ds[0])
 PY
 ```
+
+Reward validation against an 8-row CrossThink sample confirmed that exact gold
+`<answer>` completions score `1.8` with `--reasoning-lang en`, while wrong but
+well-formatted completions and missing-answer completions both score `0.0` after the
+correctness gate.
 
 Only after dataset loading and reward behavior are verified, run a one-step GRPO smoke run
 with a small sample count and a writable output directory.

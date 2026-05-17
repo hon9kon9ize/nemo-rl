@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import argparse
 import functools
+import hashlib
+import json
 import os
+from pathlib import Path
 import re
+import time
 from typing import Any
 
 from datasets_loader import dataset_from_args, build_interleaved_messages
@@ -36,6 +40,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging-steps", type=int, default=5)
     parser.add_argument("--save-steps", type=int, default=100)
+    parser.add_argument(
+        "--report-to",
+        default="none",
+        help="Comma-separated metric sinks for TRL, for example tensorboard or wandb.",
+    )
+    parser.add_argument(
+        "--wandb",
+        "-wandb",
+        action="store_true",
+        help="Also report training metrics to Weights & Biases.",
+    )
+    parser.add_argument(
+        "--generation-log-file",
+        default=None,
+        help="JSONL path for generated completions. Defaults to OUTPUT_DIR/generations.jsonl.",
+    )
+    parser.add_argument(
+        "--generation-log-prompts",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include prompt text in generation JSONL records when available.",
+    )
+    parser.add_argument(
+        "--disable-generation-logging",
+        action="store_true",
+        help="Disable JSONL logging of generated completions.",
+    )
     parser.add_argument(
         "--reasoning-lang",
         "--reasoning_lang",
@@ -92,6 +123,38 @@ def correctness_reward(completions, answer, **kwargs) -> list[float]:
         else:
             rewards.append(0.0)
     return rewards
+
+
+def _as_list(values: Any) -> list[Any]:
+    if isinstance(values, list):
+        return values
+    if isinstance(values, tuple):
+        return list(values)
+    return [values]
+
+
+def _column_item(values: Any, index: int) -> Any:
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes, dict)):
+        return values
+    try:
+        return values[index]
+    except (IndexError, KeyError, TypeError):
+        return None
+
+
+def _jsonable(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def _stable_hash(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
 
 
 def _indexed_item(values: Any, index: int) -> Any | None:
@@ -296,7 +359,152 @@ def select_reward_funcs(args: argparse.Namespace, dataset: Any) -> list[Any]:
                 )
             )
         )
+    if not args.disable_generation_logging:
+        reward_funcs.append(GenerationJsonlLogger(args).generation_jsonl_logger)
     return reward_funcs
+
+
+def generation_log_path(args: argparse.Namespace) -> Path:
+    return Path(args.generation_log_file or Path(args.output_dir) / "generations.jsonl")
+
+
+def resolve_report_to(args: argparse.Namespace) -> str | list[str]:
+    """Resolve metric reporting targets from --report-to and --wandb."""
+    if args.report_to in {None, "", "none"}:
+        report_targets: list[str] = []
+    else:
+        report_targets = [
+            target.strip()
+            for target in str(args.report_to).split(",")
+            if target.strip()
+        ]
+
+    if args.wandb and "wandb" not in report_targets:
+        report_targets.append("wandb")
+    return report_targets if report_targets else "none"
+
+
+class GenerationJsonlLogger:
+    """Write one JSONL record per generated completion without changing rewards."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.path = generation_log_path(args)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.include_prompts = args.generation_log_prompts
+        self.language_reward_weight = args.language_reward_weight
+        self._next_batch_id = 0
+
+    def generation_jsonl_logger(
+        self,
+        completions,
+        answer=None,
+        prompt=None,
+        prompts=None,
+        reasoning_lang=None,
+        reasoning_language=None,
+        language=None,
+        task_type=None,
+        **kwargs,
+    ) -> list[float]:
+        completion_list = _as_list(completions)
+        answer_list = _as_list(answer) if answer is not None else None
+        prompt_values = prompts if prompts is not None else prompt
+
+        correctness = (
+            correctness_reward(completion_list, answer=answer_list, **kwargs)
+            if answer_list is not None
+            else [None] * len(completion_list)
+        )
+        format_rewards = xml_format_reward(completion_list, **kwargs)
+        gated_format = [
+            reward if correct and correct > 0.0 else 0.0
+            for reward, correct in zip(format_rewards, correctness)
+        ]
+
+        language_values = reasoning_lang
+        if language_values is None:
+            language_values = reasoning_language
+        if language_values is None:
+            language_values = language
+        language_rewards: list[float | None]
+        gated_language: list[float | None]
+        if language_values is not None:
+            language_rewards = language_consistency_reward(
+                completion_list,
+                reasoning_lang=language_values,
+                **kwargs,
+            )
+            gated_language = [
+                self.language_reward_weight * reward if correct and correct > 0.0 else 0.0
+                for reward, correct in zip(language_rewards, correctness)
+            ]
+        else:
+            language_rewards = [None] * len(completion_list)
+            gated_language = [None] * len(completion_list)
+
+        records = []
+        batch_id = self._next_batch_id
+        self._next_batch_id += 1
+        created_at = time.time()
+        for index, completion in enumerate(completion_list):
+            correct = _column_item(correctness, index)
+            fmt = _column_item(format_rewards, index)
+            gated_fmt = _column_item(gated_format, index)
+            lang = _column_item(language_rewards, index)
+            gated_lang = _column_item(gated_language, index)
+            weighted_reward = 0.0
+            for value in (correct, gated_fmt, gated_lang):
+                if isinstance(value, (int, float)):
+                    weighted_reward += float(value)
+
+            record = {
+                "batch_id": batch_id,
+                "generation_index": index,
+                "created_at": created_at,
+                "process_rank": os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")),
+                "completion": _jsonable(completion),
+                "answer": _jsonable(_column_item(answer, index)),
+                "task_type": _jsonable(_column_item(task_type, index)),
+                "reasoning_lang": _jsonable(_column_item(language_values, index)),
+                "rewards": {
+                    "correctness_reward": correct,
+                    "xml_format_reward": fmt,
+                    "correctness_gated_xml_format_reward": gated_fmt,
+                    "language_consistency_reward": lang,
+                    "correctness_gated_weighted_language_consistency_reward": gated_lang,
+                },
+                "weighted_reward": weighted_reward,
+            }
+            prompt_item = _column_item(prompt_values, index)
+            if self.include_prompts:
+                record["prompt"] = _jsonable(prompt_item)
+            else:
+                record["prompt_hash"] = _stable_hash(prompt_item)
+                record["prompt_char_len"] = len("" if prompt_item is None else str(prompt_item))
+            records.append(record)
+
+        self._append_jsonl(records)
+        return [0.0] * len(completion_list)
+
+    def _append_jsonl(self, records: list[dict[str, Any]]) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            try:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+
+            try:
+                import fcntl
+
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
 
 
 def main():
@@ -371,7 +579,7 @@ def main():
         save_steps=args.save_steps,
         bf16=args.bf16,
         seed=args.seed,
-        report_to="none",  # Change to tensorboard or wandb as needed
+        report_to=resolve_report_to(args),
     )
 
     # 4. Initialize GRPOTrainer
