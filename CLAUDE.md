@@ -99,6 +99,8 @@ Generated completions are logged to JSONL by default at `OUTPUT_DIR/generations.
 Use `--generation-log-file path/to/file.jsonl` to choose a path, or
 `--disable-generation-logging` to turn it off. The logger is implemented as a no-op
 reward function that always returns `0.0`, so it does not change training scores.
+Use `--profile-rewards` to write per-reward timing records to
+`OUTPUT_DIR/reward_profile.jsonl`; the PJM launcher enables this by default.
 
 Chat-template handling follows `../reasoning_grpo`: `--assistant-prefill-think` appends
 `<think>\n` after the assistant generation marker when needed, and

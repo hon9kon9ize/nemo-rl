@@ -99,6 +99,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable JSONL logging of generated completions.",
     )
     parser.add_argument(
+        "--profile-rewards",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write reward function timing records to JSONL for bottleneck diagnosis.",
+    )
+    parser.add_argument(
+        "--reward-profile-log-file",
+        default=None,
+        help="JSONL path for reward timing profile records. Defaults to OUTPUT_DIR/reward_profile.jsonl.",
+    )
+    parser.add_argument(
         "--reasoning-lang",
         "--reasoning_lang",
         "--reansoning_lang",
@@ -110,7 +121,75 @@ def build_parser() -> argparse.ArgumentParser:
         "--language-reward-weight",
         type=float,
         default=0.2,
-        help="Multiplier for the language consistency reward when --reasoning-lang is used.",
+        help=(
+            "Initial multiplier for the language consistency reward when "
+            "--reasoning-lang is used. In legacy gated mode this is the fixed "
+            "language reward multiplier."
+        ),
+    )
+    parser.add_argument(
+        "--reward-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use a smooth one-way reward curriculum based on EMA correctness. "
+            "Disable with --no-reward-curriculum to use legacy correctness-gated "
+            "format/language rewards."
+        ),
+    )
+    parser.add_argument(
+        "--reward-curriculum-ema-decay",
+        type=float,
+        default=0.95,
+        help="EMA decay for batch correctness in the reward curriculum.",
+    )
+    parser.add_argument(
+        "--reward-curriculum-initial-correctness",
+        type=float,
+        default=0.0,
+        help="Initial EMA correctness ratio for reward curriculum mode.",
+    )
+    parser.add_argument(
+        "--reward-curriculum-start-correctness",
+        type=float,
+        default=0.05,
+        help="Best EMA correctness ratio that maps to curriculum progress 0.0.",
+    )
+    parser.add_argument(
+        "--reward-curriculum-end-correctness",
+        type=float,
+        default=0.60,
+        help="Best EMA correctness ratio that maps to curriculum progress 1.0.",
+    )
+    parser.add_argument(
+        "--correctness-reward-weight",
+        type=float,
+        default=1.0,
+        help="Initial correctness reward multiplier for reward curriculum mode.",
+    )
+    parser.add_argument(
+        "--correctness-reward-weight-final",
+        type=float,
+        default=1.8,
+        help="Final correctness reward multiplier for reward curriculum mode.",
+    )
+    parser.add_argument(
+        "--format-reward-weight",
+        type=float,
+        default=0.5,
+        help="Initial XML format reward multiplier for reward curriculum mode.",
+    )
+    parser.add_argument(
+        "--format-reward-weight-final",
+        type=float,
+        default=0.1,
+        help="Final XML format reward multiplier for reward curriculum mode.",
+    )
+    parser.add_argument(
+        "--language-reward-weight-final",
+        type=float,
+        default=0.1,
+        help="Final language consistency reward multiplier for reward curriculum mode.",
     )
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--use-lora", action="store_true", default=True)
@@ -504,6 +583,119 @@ def correctness_gated_reward(reward_func):
     return wrapped
 
 
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return min(max(value, lower), upper)
+
+
+def _lerp(start: float, end: float, progress: float) -> float:
+    return start + (end - start) * progress
+
+
+def _smoothstep(progress: float) -> float:
+    progress = _clamp(progress, 0.0, 1.0)
+    return progress * progress * (3.0 - 2.0 * progress)
+
+
+class RewardCurriculum:
+    """Smooth one-way reward weights based on best EMA correctness."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.ema_decay = _clamp(args.reward_curriculum_ema_decay, 0.0, 0.999999)
+        self.start_correctness = args.reward_curriculum_start_correctness
+        self.end_correctness = args.reward_curriculum_end_correctness
+        self.correctness_weight_start = args.correctness_reward_weight
+        self.correctness_weight_final = args.correctness_reward_weight_final
+        self.format_weight_start = args.format_reward_weight
+        self.format_weight_final = args.format_reward_weight_final
+        self.language_weight_start = args.language_reward_weight
+        self.language_weight_final = args.language_reward_weight_final
+        self.ema_correctness = _clamp(
+            args.reward_curriculum_initial_correctness,
+            0.0,
+            1.0,
+        )
+        self.best_ema_correctness = self.ema_correctness
+        self.last_batch_correctness = 0.0
+        self.update_count = 0
+
+    def update(self, correctness_values: list[float]) -> None:
+        numeric = [
+            float(value)
+            for value in correctness_values
+            if isinstance(value, (int, float))
+        ]
+        batch_correctness = sum(numeric) / max(len(numeric), 1)
+        self.last_batch_correctness = batch_correctness
+        self.ema_correctness = (
+            self.ema_decay * self.ema_correctness
+            + (1.0 - self.ema_decay) * batch_correctness
+        )
+        self.best_ema_correctness = max(
+            self.best_ema_correctness,
+            self.ema_correctness,
+        )
+        self.update_count += 1
+
+    def progress(self) -> float:
+        span = self.end_correctness - self.start_correctness
+        if span <= 0.0:
+            raw_progress = 1.0 if self.best_ema_correctness >= self.end_correctness else 0.0
+        else:
+            raw_progress = (
+                self.best_ema_correctness - self.start_correctness
+            ) / span
+        return _smoothstep(raw_progress)
+
+    def weights(self) -> dict[str, float]:
+        progress = self.progress()
+        return {
+            "correctness_weight": _lerp(
+                self.correctness_weight_start,
+                self.correctness_weight_final,
+                progress,
+            ),
+            "format_weight": _lerp(
+                self.format_weight_start,
+                self.format_weight_final,
+                progress,
+            ),
+            "language_weight": _lerp(
+                self.language_weight_start,
+                self.language_weight_final,
+                progress,
+            ),
+        }
+
+    def snapshot(self) -> dict[str, float | int]:
+        progress = self.progress()
+        return {
+            "update_count": self.update_count,
+            "last_batch_correctness": self.last_batch_correctness,
+            "ema_correctness": self.ema_correctness,
+            "best_ema_correctness": self.best_ema_correctness,
+            "start_correctness": self.start_correctness,
+            "end_correctness": self.end_correctness,
+            "progress": progress,
+            **self.weights(),
+        }
+
+    def weighted_correctness_reward(self, completions, answer, **kwargs) -> list[float]:
+        rewards = correctness_reward(completions, answer=answer, **kwargs)
+        self.update(rewards)
+        weight = self.weights()["correctness_weight"]
+        return [weight * reward for reward in rewards]
+
+    def weighted_xml_format_reward(self, completions, **kwargs) -> list[float]:
+        rewards = xml_format_reward(completions, **kwargs)
+        weight = self.weights()["format_weight"]
+        return [weight * reward for reward in rewards]
+
+    def weighted_language_consistency_reward(self, completions, **kwargs) -> list[float]:
+        rewards = language_consistency_reward(completions, **kwargs)
+        weight = self.weights()["language_weight"]
+        return [weight * reward for reward in rewards]
+
+
 def with_prefilled_think_normalization(reward_func, enabled: bool = True):
     """Wrap a reward function so prompt-prefilled <think> completions parse correctly."""
 
@@ -542,35 +734,67 @@ def resolve_reasoning_lang(example: dict[str, Any], default: str | None) -> str 
 
 
 def select_reward_funcs(args: argparse.Namespace, dataset: Any) -> list[Any]:
-    reward_funcs = [
-        with_prefilled_think_normalization(
-            correctness_reward,
-            enabled=args.normalize_prefilled_think,
-        ),
-        with_prefilled_think_normalization(
-            correctness_gated_reward(xml_format_reward),
-            enabled=args.normalize_prefilled_think,
-        ),
-    ]
-    if args.reasoning_lang or dataset_has_reasoning_lang(dataset):
-        reward_funcs.append(
+    has_language_reward = args.reasoning_lang or dataset_has_reasoning_lang(dataset)
+    curriculum = RewardCurriculum(args) if args.reward_curriculum else None
+
+    if curriculum is not None:
+        reward_funcs = [
             with_prefilled_think_normalization(
-                correctness_gated_reward(
-                    weighted_reward(
-                        language_consistency_reward,
-                        args.language_reward_weight,
-                    )
-                ),
+                curriculum.weighted_correctness_reward,
                 enabled=args.normalize_prefilled_think,
+            ),
+            with_prefilled_think_normalization(
+                curriculum.weighted_xml_format_reward,
+                enabled=args.normalize_prefilled_think,
+            ),
+        ]
+        if has_language_reward:
+            reward_funcs.append(
+                with_prefilled_think_normalization(
+                    curriculum.weighted_language_consistency_reward,
+                    enabled=args.normalize_prefilled_think,
+                )
             )
-        )
+    else:
+        reward_funcs = [
+            with_prefilled_think_normalization(
+                correctness_reward,
+                enabled=args.normalize_prefilled_think,
+            ),
+            with_prefilled_think_normalization(
+                correctness_gated_reward(xml_format_reward),
+                enabled=args.normalize_prefilled_think,
+            ),
+        ]
+        if has_language_reward:
+            reward_funcs.append(
+                with_prefilled_think_normalization(
+                    correctness_gated_reward(
+                        weighted_reward(
+                            language_consistency_reward,
+                            args.language_reward_weight,
+                        )
+                    ),
+                    enabled=args.normalize_prefilled_think,
+                )
+            )
+
     if not args.disable_generation_logging:
-        reward_funcs.append(GenerationJsonlLogger(args).generation_jsonl_logger)
+        reward_funcs.append(
+            GenerationJsonlLogger(args, curriculum=curriculum).generation_jsonl_logger
+        )
+    if args.profile_rewards:
+        profiler = RewardTimingProfiler(args)
+        reward_funcs = [profiler.wrap(reward_func) for reward_func in reward_funcs]
     return reward_funcs
 
 
 def generation_log_path(args: argparse.Namespace) -> Path:
     return Path(args.generation_log_file or Path(args.output_dir) / "generations.jsonl")
+
+
+def reward_profile_log_path(args: argparse.Namespace) -> Path:
+    return Path(args.reward_profile_log_file or Path(args.output_dir) / "reward_profile.jsonl")
 
 
 def resolve_report_to(args: argparse.Namespace) -> str | list[str]:
@@ -674,15 +898,73 @@ def build_grpo_config(config_cls: Any, args: argparse.Namespace) -> Any:
     )
 
 
+class RewardTimingProfiler:
+    """Write compact timing records for reward function calls."""
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.path = reward_profile_log_path(args)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.print_every = max(args.logging_steps, 1)
+        self._stats: dict[str, dict[str, float]] = {}
+
+    def wrap(self, reward_func):
+        @functools.wraps(reward_func)
+        def wrapped(completions, *args, **kwargs):
+            completion_count = len(_as_list(completions))
+            start = time.perf_counter()
+            rewards = reward_func(completions, *args, **kwargs)
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            self.record(reward_func.__name__, elapsed_ms, completion_count)
+            return rewards
+
+        return wrapped
+
+    def record(self, reward_name: str, elapsed_ms: float, completion_count: int) -> None:
+        rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+        record = {
+            "created_at": time.time(),
+            "process_rank": rank,
+            "reward_name": reward_name,
+            "elapsed_ms": elapsed_ms,
+            "completion_count": completion_count,
+            "ms_per_completion": elapsed_ms / max(completion_count, 1),
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+
+        stats = self._stats.setdefault(
+            reward_name,
+            {"calls": 0.0, "elapsed_ms": 0.0, "completion_count": 0.0},
+        )
+        stats["calls"] += 1.0
+        stats["elapsed_ms"] += elapsed_ms
+        stats["completion_count"] += float(completion_count)
+        if int(stats["calls"]) % self.print_every == 0:
+            avg_batch_ms = stats["elapsed_ms"] / stats["calls"]
+            avg_item_ms = stats["elapsed_ms"] / max(stats["completion_count"], 1.0)
+            print(
+                f"[reward-profile rank={rank}] {reward_name}: "
+                f"avg_batch_ms={avg_batch_ms:.3f} "
+                f"avg_item_ms={avg_item_ms:.3f} "
+                f"calls={int(stats['calls'])}"
+            )
+
+
 class GenerationJsonlLogger:
     """Write one JSONL record per generated completion without changing rewards."""
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        curriculum: RewardCurriculum | None = None,
+    ) -> None:
         self.path = generation_log_path(args)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.include_prompts = args.generation_log_prompts
         self.language_reward_weight = args.language_reward_weight
         self.normalize_prefilled_think = args.normalize_prefilled_think
+        self.curriculum = curriculum
         self._next_batch_id = 0
 
     def generation_jsonl_logger(
@@ -743,6 +1025,36 @@ class GenerationJsonlLogger:
             language_rewards = [None] * len(completion_list)
             gated_language = [None] * len(completion_list)
 
+        curriculum_snapshot = (
+            self.curriculum.snapshot() if self.curriculum is not None else None
+        )
+        if curriculum_snapshot is not None:
+            correctness_weight = float(curriculum_snapshot["correctness_weight"])
+            format_weight = float(curriculum_snapshot["format_weight"])
+            language_weight = float(curriculum_snapshot["language_weight"])
+            weighted_correctness = [
+                correctness_weight * reward
+                if isinstance(reward, (int, float))
+                else None
+                for reward in correctness
+            ]
+            weighted_format = [
+                format_weight * reward
+                if isinstance(reward, (int, float))
+                else None
+                for reward in format_rewards
+            ]
+            weighted_language = [
+                language_weight * reward
+                if isinstance(reward, (int, float))
+                else None
+                for reward in language_rewards
+            ]
+        else:
+            weighted_correctness = correctness
+            weighted_format = gated_format
+            weighted_language = gated_language
+
         records = []
         batch_id = self._next_batch_id
         self._next_batch_id += 1
@@ -754,8 +1066,11 @@ class GenerationJsonlLogger:
             gated_fmt = _column_item(gated_format, index)
             lang = _column_item(language_rewards, index)
             gated_lang = _column_item(gated_language, index)
+            weighted_correct = _column_item(weighted_correctness, index)
+            weighted_fmt = _column_item(weighted_format, index)
+            weighted_lang = _column_item(weighted_language, index)
             weighted_reward = 0.0
-            for value in (correct, gated_fmt, gated_lang):
+            for value in (weighted_correct, weighted_fmt, weighted_lang):
                 if isinstance(value, (int, float)):
                     weighted_reward += float(value)
 
@@ -774,9 +1089,14 @@ class GenerationJsonlLogger:
                     "correctness_gated_xml_format_reward": gated_fmt,
                     "language_consistency_reward": lang,
                     "correctness_gated_weighted_language_consistency_reward": gated_lang,
+                    "weighted_correctness_reward": weighted_correct,
+                    "weighted_xml_format_reward": weighted_fmt,
+                    "weighted_language_consistency_reward": weighted_lang,
                 },
                 "weighted_reward": weighted_reward,
             }
+            if curriculum_snapshot is not None:
+                record["reward_curriculum"] = _jsonable(curriculum_snapshot)
             if normalized_completion != _completion_text(completion):
                 record["normalized_completion"] = _jsonable(normalized_completion)
             prompt_item = _column_item(prompt_values, index)

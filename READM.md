@@ -166,6 +166,32 @@ python train.py --no-generation-log-prompts
 Each JSONL record includes the completion, target answer, reasoning language, reward
 components, weighted reward, process rank, and prompt when available.
 
+## Speed Diagnostics
+
+Reward functions are Python functions called by TRL during reward evaluation; in this
+single-process launcher they are not parallelized. They should be cheap compared with
+model generation. To measure reward overhead on the cluster, use:
+
+```bash
+python train.py --profile-rewards
+```
+
+This writes:
+
+```text
+OUTPUT_DIR/reward_profile.jsonl
+```
+
+The PJM launcher enables reward profiling by default. If steps are slow, first try:
+
+```bash
+--max-completion-length 256
+--disable-generation-logging
+--no-generation-log-prompts
+```
+
+Long GRPO generation is usually the bottleneck, especially without vLLM.
+
 ## Weights & Biases
 
 Enable W&B metrics:
