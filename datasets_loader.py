@@ -23,13 +23,11 @@ LANGUAGE_NAMES = {
 }
 
 INTERLEAVED_SYSTEM_PROMPT = (
-    "You are an interleaved reasoning agent. For every step: "
-    "Start with exactly one <think> block and close every tag you open. "
-    "Never output </think> unless it closes a matching <think> block. "
-    "1. Use <think> to plan. "
-    "2. Perform an action, either a Math <answer>...</answer> or a <tool_call>...</tool_call>. "
-    "3. Use <think> to reflect on the result. "
-    "Be concise; reach the first action as quickly as possible."
+    "You are a math solver. Generation begins after an already-open <think> tag. "
+    "Do not emit another opening <think> tag. Continue with concise private "
+    "reasoning, then close it exactly once with </think>. Immediately after "
+    "</think>, emit exactly one <answer>final result</answer>. Do not write "
+    "headings, markdown, explanations, or any text outside these tags."
 )
 
 
@@ -44,12 +42,16 @@ def build_interleaved_messages(
     if target_language:
         language = _language_name(target_language)
         user_content = (
-            f"Solve this step-by-step. Write all private reasoning inside "
-            f"<think>...</think> in {language}. Put only the final math result "
-            f"in <answer>...</answer>: {question.strip()}"
+            f"Solve the problem. Keep private reasoning concise and write it in "
+            f"{language}. After reasoning, close </think> and put only the final "
+            f"math result inside one <answer>...</answer> tag: {question.strip()}"
         )
     else:
-        user_content = f"Solve this step-by-step. Put the final math result in <answer>...</answer>: {question.strip()}"
+        user_content = (
+            "Solve the problem. Keep private reasoning concise. After reasoning, "
+            "close </think> and put only the final math result inside one "
+            f"<answer>...</answer> tag: {question.strip()}"
+        )
     return [
         {"role": "system", "content": INTERLEAVED_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},

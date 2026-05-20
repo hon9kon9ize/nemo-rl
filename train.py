@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Prepend a missing opening <think> back to completions before reward parsing when the prompt prefilled it.",
     )
-    parser.add_argument("--temperature", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--beta", type=float, default=0.04)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--logging-steps", type=int, default=5)
@@ -213,6 +213,8 @@ def xml_format_reward(completions, **kwargs) -> list[float]:
         # Check interleaving or multiple think blocks if desired
         if content.count("<think>") >= 1:
             score += 0.1
+        if re.search(r"</think>\s*<answer>.*?</answer>\s*$", content, re.DOTALL):
+            score += 0.2
         rewards.append(score)
     return rewards
 
@@ -272,7 +274,7 @@ def assistant_generation_tail(prompt: str) -> str:
     for marker in assistant_generation_markers():
         index = prompt.rfind(marker)
         if index >= 0:
-            return prompt[index + len(marker):]
+            return prompt[index + len(marker) :]
     return prompt[-256:]
 
 
@@ -296,7 +298,9 @@ def prompt_prefills_open_think(prompt: Any) -> bool:
     text = "" if prompt is None else str(prompt)
     assistant_tail = assistant_generation_tail(text)
     stripped = assistant_tail.lstrip()
-    return stripped.startswith("<think>") and assistant_tail.count("<think>") > assistant_tail.count("</think>")
+    return stripped.startswith("<think>") and assistant_tail.count(
+        "<think>"
+    ) > assistant_tail.count("</think>")
 
 
 def apply_chat_template_text(
@@ -551,7 +555,9 @@ def language_consistency_reward(
         if not reasoning_text or target_language is None:
             rewards.append(0.0)
             continue
-        rewards.append(1.0 if _matches_language(reasoning_text, target_language) else 0.0)
+        rewards.append(
+            1.0 if _matches_language(reasoning_text, target_language) else 0.0
+        )
     return rewards
 
 
@@ -574,10 +580,7 @@ def correctness_gated_reward(reward_func):
     def wrapped(completions, answer, **kwargs):
         gates = correctness_reward(completions, answer=answer, **kwargs)
         rewards = reward_func(completions, answer=answer, **kwargs)
-        return [
-            reward if gate > 0.0 else 0.0
-            for reward, gate in zip(rewards, gates)
-        ]
+        return [reward if gate > 0.0 else 0.0 for reward, gate in zip(rewards, gates)]
 
     wrapped.__name__ = f"correctness_gated_{reward_func.__name__}"
     return wrapped
@@ -639,11 +642,11 @@ class RewardCurriculum:
     def progress(self) -> float:
         span = self.end_correctness - self.start_correctness
         if span <= 0.0:
-            raw_progress = 1.0 if self.best_ema_correctness >= self.end_correctness else 0.0
-        else:
             raw_progress = (
-                self.best_ema_correctness - self.start_correctness
-            ) / span
+                1.0 if self.best_ema_correctness >= self.end_correctness else 0.0
+            )
+        else:
+            raw_progress = (self.best_ema_correctness - self.start_correctness) / span
         return _smoothstep(raw_progress)
 
     def weights(self) -> dict[str, float]:
@@ -690,7 +693,9 @@ class RewardCurriculum:
         weight = self.weights()["format_weight"]
         return [weight * reward for reward in rewards]
 
-    def weighted_language_consistency_reward(self, completions, **kwargs) -> list[float]:
+    def weighted_language_consistency_reward(
+        self, completions, **kwargs
+    ) -> list[float]:
         rewards = language_consistency_reward(completions, **kwargs)
         weight = self.weights()["language_weight"]
         return [weight * reward for reward in rewards]
@@ -704,7 +709,9 @@ def with_prefilled_think_normalization(reward_func, enabled: bool = True):
         prompt_values = kwargs.get("prompts", kwargs.get("prompt"))
         completion_list = _as_list(completions)
         if prompt_values is None:
-            normalized = [_completion_text(completion) for completion in completion_list]
+            normalized = [
+                _completion_text(completion) for completion in completion_list
+            ]
         else:
             normalized = normalize_prefilled_think_completions(
                 _as_list(prompt_values),
@@ -794,7 +801,9 @@ def generation_log_path(args: argparse.Namespace) -> Path:
 
 
 def reward_profile_log_path(args: argparse.Namespace) -> Path:
-    return Path(args.reward_profile_log_file or Path(args.output_dir) / "reward_profile.jsonl")
+    return Path(
+        args.reward_profile_log_file or Path(args.output_dir) / "reward_profile.jsonl"
+    )
 
 
 def resolve_report_to(args: argparse.Namespace) -> str | list[str]:
@@ -893,9 +902,7 @@ def build_grpo_config(config_cls: Any, args: argparse.Namespace) -> Any:
             "temperature": args.temperature,
         }
 
-    return config_cls(
-        **filter_supported_init_kwargs(config_cls, kwargs, "GRPOConfig")
-    )
+    return config_cls(**filter_supported_init_kwargs(config_cls, kwargs, "GRPOConfig"))
 
 
 class RewardTimingProfiler:
@@ -919,7 +926,9 @@ class RewardTimingProfiler:
 
         return wrapped
 
-    def record(self, reward_name: str, elapsed_ms: float, completion_count: int) -> None:
+    def record(
+        self, reward_name: str, elapsed_ms: float, completion_count: int
+    ) -> None:
         rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
         record = {
             "created_at": time.time(),
@@ -1018,7 +1027,11 @@ class GenerationJsonlLogger:
                 **kwargs,
             )
             gated_language = [
-                self.language_reward_weight * reward if correct and correct > 0.0 else 0.0
+                (
+                    self.language_reward_weight * reward
+                    if correct and correct > 0.0
+                    else 0.0
+                )
                 for reward, correct in zip(language_rewards, correctness)
             ]
         else:
@@ -1033,21 +1046,19 @@ class GenerationJsonlLogger:
             format_weight = float(curriculum_snapshot["format_weight"])
             language_weight = float(curriculum_snapshot["language_weight"])
             weighted_correctness = [
-                correctness_weight * reward
-                if isinstance(reward, (int, float))
-                else None
+                (
+                    correctness_weight * reward
+                    if isinstance(reward, (int, float))
+                    else None
+                )
                 for reward in correctness
             ]
             weighted_format = [
-                format_weight * reward
-                if isinstance(reward, (int, float))
-                else None
+                format_weight * reward if isinstance(reward, (int, float)) else None
                 for reward in format_rewards
             ]
             weighted_language = [
-                language_weight * reward
-                if isinstance(reward, (int, float))
-                else None
+                language_weight * reward if isinstance(reward, (int, float)) else None
                 for reward in language_rewards
             ]
         else:
@@ -1078,7 +1089,9 @@ class GenerationJsonlLogger:
                 "batch_id": batch_id,
                 "generation_index": index,
                 "created_at": created_at,
-                "process_rank": os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")),
+                "process_rank": os.environ.get(
+                    "RANK", os.environ.get("LOCAL_RANK", "0")
+                ),
                 "completion": _jsonable(completion),
                 "answer": _jsonable(_column_item(answer, index)),
                 "task_type": _jsonable(_column_item(task_type, index)),
@@ -1104,7 +1117,9 @@ class GenerationJsonlLogger:
                 record["prompt"] = _jsonable(prompt_item)
             else:
                 record["prompt_hash"] = _stable_hash(prompt_item)
-                record["prompt_char_len"] = len("" if prompt_item is None else str(prompt_item))
+                record["prompt_char_len"] = len(
+                    "" if prompt_item is None else str(prompt_item)
+                )
             records.append(record)
 
         self._append_jsonl(records)
@@ -1120,7 +1135,9 @@ class GenerationJsonlLogger:
                 pass
 
             for record in records:
-                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                )
             handle.flush()
 
             try:
